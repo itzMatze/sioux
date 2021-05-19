@@ -928,6 +928,7 @@ void sx_vid_render_frame_rect()
     get_flow_matrix(&ent->prev_q, ent->prev_x, Mp);
     mat4_inv(Mp, MpI);
     mat4_mul(MpI, Mc, M);
+    // M projection matrix from the last frame to the current frame
     // fprintf(stderr, "%g %g %g -> %g %g %g\n",
     //     ent->body.c[0], ent->body.c[1], ent->body.c[2],
     //     ent->prev_x[0], ent->prev_x[1], ent->prev_x[2]);
@@ -1855,6 +1856,28 @@ int sx_vid_handle_input()
         case SDLK_SPACE:
           P->ctl.trigger_fire = 1;
           break;
+#if 0
+// some stuff to reset heli and shoot it up in the sky
+        case SDLK_z:
+        // reset all forces and speeds to be able to recover from crashing
+        for (int i = 0; i < 3; i++)
+        {
+          P->body.pv[i] = 0.0f;
+          P->body.pw[i] = 0.0f;
+          P->body.v[i] = 0.0f;
+          P->body.w[i] = 0.0f;
+          P->body.torque[i] = 0.0f;
+          P->body.force[i] = 0.0f;
+        }
+        P->body.q.x[0] = 0.0f;
+        P->body.q.x[1] = -0.991452f;
+        P->body.q.x[2] = 0.0f;
+        P->body.q.w = 0.130473f;
+          break;
+        case SDLK_LSHIFT:
+          P->body.c[1] += 100;
+          break;
+#endif
       }
       break;
       case SDL_KEYUP:
