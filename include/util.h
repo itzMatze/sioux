@@ -56,6 +56,59 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define CLAMP(a, m, M) MIN(MAX(a, m), M)
 
+static inline void copy(float a[], float b[])
+{
+  b[1] = a[1];
+  b[2] = a[2];
+  b[3] = a[3];
+}
+
+static inline void subtract(float a[], float b[], float c[])
+{
+  c[1] = a[1] - b[1];
+  c[2] = a[2] - b[2];
+  c[3] = a[3] - b[3];
+}
+
+static inline void add(float a[], float b[], float c[])
+{
+  c[1] = a[1] + b[1];
+  c[2] = a[2] + b[2];
+  c[3] = a[3] + b[3];
+}
+
+static inline void divide(float a[], float b[], float c[])
+{
+  c[1] = a[1] / b[1];
+  c[2] = a[2] / b[2];
+  c[3] = a[3] / b[3];
+}
+
+static inline void multiply(float a[], float b[], float c[])
+{
+  c[1] = a[1] * b[1];
+  c[2] = a[2] * b[2];
+  c[3] = a[3] * b[3];
+}
+
+static inline void multiplyNumber(float a[], float b, float c[])
+{
+  c[1] = a[1] * b;
+  c[2] = a[2] * b;
+  c[3] = a[3] * b;
+}
+
+static inline float length(float a[])
+{
+  return sqrt(pow(a[0], 2) + pow(a[1], 2) + pow(a[2], 2));
+}
+
+static inline float smoothstep(float edge0, float edge1, float x)
+{
+  float t = CLAMP((x - edge0) / (edge1 - edge0), 0.0, 1.0);
+  return t * t * (3.0 - 2.0 * t);
+}
+
 static inline void normalise(float *f)
 {
   const float len = 1.0f/sqrtf(dot(f, f));

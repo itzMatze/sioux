@@ -6,6 +6,9 @@
 #include "physics/obb_obb.h"
 #include "move/common.h"
 #include "gameplay.h"
+#include "matrix3.h"
+#include "physics/curl_noise.h"
+#include <sys/time.h>
 
 // helicopter move routines
 
@@ -36,7 +39,10 @@ typedef enum sx_helo_surf_t
   s_helo_surf_vstab = 0,
   s_helo_surf_hstab_l,
   s_helo_surf_hstab_r,
-  s_helo_surf_cnt,
+  s_helo_rotor_start,
+  s_helo_rotor_blade_count = 5,
+  s_helo_rotor_blade_parts = 50,
+  s_helo_surf_cnt = s_helo_rotor_blade_count * s_helo_rotor_blade_parts + s_helo_rotor_start,
 }
 sx_helo_surf_t;
 
@@ -72,6 +78,7 @@ typedef struct sx_move_helo_t
   float dmg_wing_tail;
   float dmg_wing_left;
   float dmg_wing_right;
+  uint32_t vortex_time;
 }
 sx_move_helo_t;
 
@@ -85,6 +92,9 @@ sx_helo_alt_above_ground(const sx_entity_t *e)
 void
 sx_move_helo_update_forces(sx_entity_t *e, sx_rigid_body_t *b)
 {
+  struct timeval t0, t1;
+  gettimeofday(&t0, NULL);
+  
   sx_move_helo_t *h = e->move_data;
   sx_actuator_t a;
 
@@ -108,25 +118,225 @@ sx_move_helo_update_forces(sx_entity_t *e, sx_rigid_body_t *b)
   // main rotor runs at fixed rpm, so we get some constant anti-torque:
   // constant expressing mass ratio rotor/fuselage, lift vs torque etc
   float main_rotor_torque[3] = {0, mr*a.f[1], 0};
-  const float main_rotor_torque1_os = main_rotor_torque[1]; // main rotor torque around y in object space
+  //const float main_rotor_torque1_os = main_rotor_torque[1]; // main rotor torque around y in object space
   quat_transform(&b->q, a.r); // to world space
   quat_transform(&b->q, a.f); // to world space
   quat_transform(&b->q, main_rotor_torque);
 
   // main thrust gets weaker for great heights
   // in ground effect, fitted to a graph on dynamicflight.com says thrust improves by
-  const float hp = (b->c[1]-sx_helo_alt_above_ground(e)) / h->main_rotor_radius; // height above ground in units of rotor diameter
+  const float hp = (sx_helo_alt_above_ground(e)) / h->main_rotor_radius; // height above ground in units of rotor diameter
   // const float inground = hp < 3.0f ? 35.f*CLAMP(.5-(hp-2.0f)/(2.0f*sqrtf(1.0f+(hp-2.0f)*(hp-2.0f))), 0.0f, 1.0f) : 0.0f;
-  const float inground = hp < 3.0f ? 18.0f*CLAMP(3.0f-hp, 0, 3.0f) : 0.0f;
+  const float inground = hp < 3.0f ? 6.0f*CLAMP(3.0f-hp, 0, 3.0f) : 0.0f;
   // height in meters where our rotor becomes ineffective (service height)
   // TODO: some soft efficiency with height?
   const float cutoff = b->c[1] > h->service_height ? 0.0f : 1.0f; // hard cutoff
   const float percent = (100.0 + inground) * e->ctl.collective; // where 70 means float out of ground, 60 float in ground ~25m
   for(int k=0;k<3;k++) a.f[k] *= cutoff * 9.81f*b->m * percent / 70.0f;
+
   if(e->hitpoints > 0.)
   {
-    sx_rigid_body_apply_torque(b, main_rotor_torque);
+    //sx_rigid_body_apply_torque(b, main_rotor_torque);
+    #if 0
+    // fly with force application
     sx_rigid_body_apply_force(b, &a);
+    #else
+    // fly with aerodynamic simulation
+    // runtime initialisation of rotorblades
+    inline float radian = 72 * M_PI / 180;
+    float rotation_mat[9] = {
+      cos(radian),  0, sin(radian),
+      0,            1,           0,
+      -sin(radian), 0, cos(radian)
+    };
+    float up[3] = {0, 1, 0};
+    float blade_buffer_one[3];
+    float blade_buffer_two[3] = {0, 0, 1};
+    // radian by which the first rotor blade is rotated, random rotation is applied here
+    radian = (((sx.time % 2486) * 3204937) % 360) * M_PI / 180;
+    float rand_rot_mat[9] = {
+      cos(radian),  0, sin(radian),
+      0,            1,           0,
+      -sin(radian), 0, cos(radian)
+    };
+    mat3_mulv(rand_rot_mat, blade_buffer_two, blade_buffer_one);
+    float drag_direction[3];
+    float section_span = 5.95 / s_helo_rotor_blade_parts; //5.95 is the radius
+    // the rotorblades are modelled counterclockwise
+    // the drag always comes from the left side of the blade
+    for (int i = 0; i < s_helo_rotor_blade_count; i++)
+    {
+      cross(up, blade_buffer_one, drag_direction);
+        float M[9] = {
+          drag_direction[0], drag_direction[1], drag_direction[2],
+          up[0], up[1], up[2],
+          blade_buffer_one[0], blade_buffer_one[1], blade_buffer_one[2]
+        };
+        float MT[9];
+        float RM[9];
+        float MRM[9];
+        float up_w_angle[3];
+      // rotorblades
+      for (int j = 0; j < s_helo_rotor_blade_parts; j++)
+      {
+        // change aoi in this loop to simulate twist of rotor blade
+        float angle_of_incidence = percent * 0.12f + (1.0f-(((float)j)/((float)s_helo_rotor_blade_parts))) * 4.0f;
+        // change aoi according to steering
+        // sideways, e.g. left roll: cyclic[0] = -1 and we want to increase aoi on the right side (blade direction in negative x direction)
+        angle_of_incidence += e->ctl.cyclic[0] * blade_buffer_one[0] * 2.0f;
+        // front/back, e.g. front roll: cyclic[1] = 1 and we want to increase aoi on the back side (blade direction in negative z direction)
+        angle_of_incidence += -e->ctl.cyclic[1] * blade_buffer_one[2] * 2.0f;
+        radian = angle_of_incidence * M_PI / 180;
+        float angle_rot_mat[9] = {
+          cos(radian), -sin(radian), 0,
+          sin(radian), cos(radian), 0,
+          0, 0, 1
+        };
+        mat3_mul(angle_rot_mat, M, RM);
+        mat3_transpose(M, MT); // M^-1 = M^T
+        mat3_mul(MT, RM, MRM);
+        mat3_mulv(MRM, up, up_w_angle);
+        cross(up_w_angle, blade_buffer_one, drag_direction);
+        h->surf[s_helo_rotor_start + i * s_helo_rotor_blade_parts + j] = (sx_aerofoil_t){
+          .orient = {
+            drag_direction[0], blade_buffer_one[0], up_w_angle[0],
+            drag_direction[1], blade_buffer_one[1], up_w_angle[1],
+            drag_direction[2], blade_buffer_one[2], up_w_angle[2],
+          },
+          .root = {h->mnr[0] + section_span * j * blade_buffer_one[0], h->mnr[1] + section_span * j * blade_buffer_one[1], h->mnr[2]  + section_span * j * blade_buffer_one[2]},
+          .chord_length = 0.4f,
+          .span = section_span,
+          .c_drag = 0.0f,
+          .c_lift = 1.0f,
+        };
+      }
+      mat3_mulv(rotation_mat, blade_buffer_one, blade_buffer_two);
+      for (int k = 0; k < 3; k++) blade_buffer_one[k] = blade_buffer_two[k];
+    }
+    // coordinate system should already be orthonormalised, so there is no need to call init_orient
+    //for(int i=0;i<s_helo_surf_cnt;i++)
+      //sx_aerofoil_init_orient(h->surf+i);
+
+    // the orientation of the main rotor is used to determine if vrs should be applied
+    float mnr_orient[3] = { h->mnr[0], h->mnr[1], h->mnr[2] };
+    quat_transform(&b->q, mnr_orient);
+    for (int i = 0; i < s_helo_rotor_blade_count; i++)
+    {
+      for (int j = 0; j < s_helo_rotor_blade_parts; j++)
+      {
+        int airfoil_index = (i*s_helo_rotor_blade_parts)+j + s_helo_rotor_start;
+        float v0[3], v1[3], root[3], orient[3], angle[3], windWS[3], heli_rot_wind[3], vrs_vel[3];
+        for (int k=0;k<3;k++) root[k] = h->surf[airfoil_index].root[k];
+        for (int k=0;k<3;k++) orient[k] = h->surf[airfoil_index].orient[k * 3 + 1];
+        for (int k=0;k<3;k++) angle[k] = h->surf[airfoil_index].orient[k * 3];
+        // rotate blade 90° backwards for gyroscopic precession
+        float rot_root[3], rot_orient[3], rot_angle[3], rot_wind[3];
+        radian = -90 * M_PI / 180;
+        float gyro_rotation_mat[9] = {
+          cos(radian),  0, sin(radian),
+          0,            1,           0,
+          -sin(radian), 0, cos(radian)
+        };
+        mat3_mulv(gyro_rotation_mat, root, rot_root);
+        mat3_mulv(gyro_rotation_mat, orient, rot_orient);
+        mat3_mulv(gyro_rotation_mat, angle, rot_angle);
+
+        float up[3] = {0, 1, 0};
+        cross(rot_orient, up, rot_wind);
+        normalise(rot_wind);
+        // v = d * pi * rpm * 0.06, what is the rpm of the comanche RAH-66?
+        for (int k = 0; k < 3; k++) rot_wind[k] *= (j+0.5f) * section_span * 2.0f * M_PI * 100 * 0.06f;
+
+        // vortex-ring-state application
+        float horizontal_vel = sqrt(b->v[0] * b->v[0] + b->v[2] * b->v[2]);
+        if ((/*1 || */(b->v[1] < -6 && b->v[1] > 3.7f*horizontal_vel - 40 && mnr_orient[1] > 0.0f)) && &sx.world.entity[sx.world.player_entity] == e)
+        {
+          if (h->vortex_time == 0)
+          {
+            h->vortex_time = sx.time;
+          }
+          float delta = sx.time - h->vortex_time;
+          float center[3] = {h->mnr[0], h->mnr[1], h->mnr[2]};
+          float x[3] = {rot_root[0], rot_root[1], rot_root[2]};
+          #if 0
+          quat_transform(&b->q, x);
+          // evaluate velocity field where the helicopter was a moment before, to simulate inertia of air circulated by VRS
+          x[0] -= b->v[0] / 5.0f;
+          x[2] -= b->v[2] / 5.0f;
+          quat_transform_inv(&b->q, x);
+          #endif
+          // offset to the point where the aerodynamic force is applied and a little random offset
+          for (int k = 0; k < 3; k++) x[k] += 0.66666f * rot_orient[k] + sinf(((sx.time % 2486) * 3204937)) / 4.0f;
+          float vortex_radius = (-b->v[1] + 2.0f) / 4.0f;
+          #if 0
+          // debug by changing radius of vrs with controls, if query has to be always true
+          vortex_radius = percent / 10.0f;
+          printf("radius: %f\n", vortex_radius);
+          #endif
+          for (int k = 0; k < 3; k++) vrs_vel[k] = 0.0f;
+          velocity_field(x, center, vortex_radius, vrs_vel);
+          // this scale should not be used, it is not physically based
+          float scale = ((percent-20.0f) / 10.0f) / fmaxf(((7.0f*(2.3f - mnr_orient[1]) + horizontal_vel / 8.0f)), 1);
+          for (int k = 0; k < 3; k++) vrs_vel[k] *= scale;
+          for (int k = 0; k < 3; k++) rot_wind[k] += vrs_vel[k];
+        }
+        else
+        {
+          h->vortex_time = 0;
+        }
+
+// use wind that is produced by the movement of the helicopter itself (makes it very hard to steer)
+#if 1
+        // transforming to world space to calculate wind produced by movement of helicopter (this movement is obviously in WS)
+        // divide by 10 to reduce the effect
+        quat_transform(&b->q, rot_wind);
+        // calculate wind produced by helicopter linear movement
+        for (int k = 0; k < 3; k++) rot_wind[k] -= (b->v[k] * 3.6f) / 10.0f;
+        // calculate wind produced by helicopter rotational movement
+        float blade_root[3] = {0.0f, 0.0f, 0.0f};
+        for (int k = 0; k < 3; k++) blade_root[k] = rot_root[k] - h->mnr[k];
+        quat_transform(&b->q, blade_root);
+        cross(blade_root, b->w, heli_rot_wind);
+        quat_transform(&b->q, heli_rot_wind);
+        for (int k = 0; k < 3; k++) rot_wind[k] += (heli_rot_wind[k] * 3.6f) / 10.0f;
+        quat_transform_inv(&b->q, rot_wind);
+#endif
+        // rotating wind forward to rotorblade position and transforming it to world space
+        radian = 90 * M_PI / 180;
+        float gyro_rot_mat_forward[9] = {
+          cos(radian),  0, sin(radian),
+          0,            1,           0,
+          -sin(radian), 0, cos(radian)
+        };
+        mat3_mulv(gyro_rot_mat_forward, rot_wind, windWS);
+        quat_transform(&b->q, windWS);
+        sx_aerofoil_apply_forces(&(h->surf[airfoil_index]), b, windWS);
+#if 0
+// debug lines
+        quat_transform(&b->q, orient);
+        quat_transform(&b->q, root);
+        quat_transform(&b->q, angle);
+        quat_transform(&b->q, vrs_vel);
+        // debug vrs velocity (only shows up when vrs effect is applied)
+        for(int k=0;k<3;k++) v0[k] = b->c[k] + root[k] + 0.6666667f * section_span * orient[k];
+        for(int k=0;k<3;k++) v1[k] = b->c[k] + root[k] + 0.6666667f * section_span * orient[k] - vrs_vel[k] / 20.0f;
+        if (h->vortex_time != 0) sx_vid_add_debug_line(v0, v1);
+        // debug rotational wind
+        for(int k=0;k<3;k++) v0[k] = b->c[k] + root[k];
+        for(int k=0;k<3;k++) v1[k] = b->c[k] + root[k] - windWS[k] / 2.0f;
+        //sx_vid_add_debug_line(v0, v1);
+        // debug main rotor blades
+        for(int k=0;k<3;k++) v0[k] = b->c[k] + root[k];
+        for(int k=0;k<3;k++) v1[k] = b->c[k] + root[k] + section_span * orient[k];
+        sx_vid_add_debug_line(v0, v1);
+        // debug aoi
+        for(int k=0;k<3;k++) v0[k] = b->c[k] + root[k];
+        for(int k=0;k<3;k++) v1[k] = b->c[k] + root[k] + angle[k];
+        sx_vid_add_debug_line(v0, v1);
+#endif
+      }
+    }
+  #endif
   }
   
   // tail rotor:
@@ -135,9 +345,20 @@ sx_move_helo_update_forces(sx_entity_t *e, sx_rigid_body_t *b)
   a.r[0] = h->tlr[0];
   a.r[1] = h->tlr[1];
   a.r[2] = h->tlr[2];
-  a.f[0] = 0.60f * b->m * e->ctl.tail; // tail thrust
+  // stupid application of counter_torque, to eliminate all torques
+  float counter_torque[3] = {0, -b->torque[1], 0};
+  float tail_rotor_force[3] = {0.0f, 0.0f, 0.0f};
+  tail_rotor_force[0] = b->torque[1] / length(h->tlr);
+  // eliminating the torque produced by the main rotor, either by applying counter_torque (easier to fly) or by using tail rotor
+#if 1
+  a.f[0] += tail_rotor_force[0];
+#else
+  quat_transform(&b->q, counter_torque);
+  sx_rigid_body_apply_torque(b, counter_torque);
+#endif
+  a.f[0] += 0.60f * b->m * e->ctl.tail; // tail thrust
   // want to counteract main rotor torque, i.e. r x f == - main rotor torque
-  a.f[0] -= main_rotor_torque1_os/a.r[2];
+  //a.f[0] -= main_rotor_torque1_os/a.r[2];
   quat_transform(&b->q, a.r); // to world space
   quat_transform(&b->q, a.f); // to world space
   sx_rigid_body_apply_force(b, &a);
@@ -185,9 +406,47 @@ sx_move_helo_update_forces(sx_entity_t *e, sx_rigid_body_t *b)
   // float lv[3];
   // cross(b->w, off, lv);
   // for(int k=0;k<3;k++) wind[k] -= lv[k];
-  for(int k=0;k<3;k++) wind[k] -= b->v[k];
-  for(int i=0;i<s_helo_surf_cnt;i++)
+  //for(int k=0;k<3;k++) wind[k] -= b->v[k];
+  // apply wind produced by linear heli movement on stabilization wings
+  for(int i=0;i<=s_helo_surf_hstab_r;i++)
     sx_aerofoil_apply_forces(h->surf+i, b, wind);
+
+#if 0
+// performance logging
+  gettimeofday(&t1, NULL);
+
+  if (h->vortex_time != 0)
+  {
+    printf("VRS\n");
+    const char* in_perf_logname = "/media/matze/T7 SSD/Bachelor/in_performance.txt";
+    FILE *in_perf_log = fopen(in_perf_logname, "a");
+    if (in_perf_log == NULL)
+    {
+      printf("Error opening in_perf_log file!\n");
+    }
+    else
+    {
+      //printf("in_perf_log successfully opened!\n");    
+    }
+    fprintf(in_perf_log, "%ld\n", t1.tv_usec - t0.tv_usec);
+    fclose(in_perf_log);
+  }
+  else
+  {
+    const char* out_perf_logname = "/media/matze/T7 SSD/Bachelor/out_performance.txt";
+    FILE *out_perf_log = fopen(out_perf_logname, "a");
+    if (out_perf_log == NULL)
+    {
+      printf("Error opening perf_log file!\n");
+    }
+    else
+    {
+      //printf("Perf_log successfully opened!\n");    
+    }
+    fprintf(out_perf_log, "%ld\n", t1.tv_usec - t0.tv_usec);
+    fclose(out_perf_log);
+  }
+#endif
 }
 
 void
@@ -844,6 +1103,65 @@ sx_move_helo_init(sx_entity_t *e)
     .c_lift = 0.8f,
   };
 
+// rotorblade initialization, is now done in physic simulation for dynamic rotorblades,
+// but some parts only need to be initialized once which then can be done in here
+#if 0
+  float radian = 72 * M_PI / 180;
+  float rotation_mat[9] = {
+    cos(radian),  0, sin(radian),
+    0,            1,           0,
+    -sin(radian), 0, cos(radian)
+  };
+  radian = 10 * M_PI / 180;
+  float angle_rot_mat[9] = {
+    cos(radian), -sin(radian), 0,
+    sin(radian), cos(radian), 0,
+    0, 0, 1
+  };
+  float up[3] = {0, 1, 0};
+  float blade_buffer_one[3] = {0, 0, 1};
+  float blade_buffer_two[3];
+  float drag_direction[3];
+  float section_span = 1.19; //5.95 is the radius
+  // the rotorblades are modelled counterclockwise
+  // the drag always comes from the left side of the blade
+  for (int i = 0; i < 5; i++)
+  {
+    cross(up, blade_buffer_one, drag_direction);
+    float M[9] = {
+      drag_direction[0], drag_direction[1], drag_direction[2],
+      up[0], up[1], up[2],
+      blade_buffer_one[0], blade_buffer_one[1], blade_buffer_one[2]
+    };
+    float MT[9];
+    float RM[9];
+    float MRM[9];
+    float up_w_angle[3];
+    mat3_mul(angle_rot_mat, M, RM);
+    mat3_transpose(M, MT); // M^-1 = M^T
+    mat3_mul(MT, RM, MRM);
+    mat3_mulv(MRM, up, up_w_angle);
+    cross(up_w_angle, blade_buffer_one, drag_direction);
+    // rotorblades
+    for (int j = 0; j < 5; j++)
+    {
+      r->surf[s_helo_rotor_one_one + i * 5 + j] = (sx_aerofoil_t){
+        .orient = {
+          drag_direction[0], blade_buffer_one[0], up_w_angle[0],
+          drag_direction[1], blade_buffer_one[1], up_w_angle[1],
+          drag_direction[2], blade_buffer_one[2], up_w_angle[2],
+        },
+        .root = {r->mnr[0] + section_span * j * blade_buffer_one[0], r->mnr[1] + section_span * j * blade_buffer_one[1], r->mnr[2]  + section_span * j * blade_buffer_one[2]},
+        .chord_length = 0.4f,
+        .span = section_span,
+        .c_drag = 0.0f,
+        .c_lift = 1.0f,
+      };
+    }
+    mat3_mulv(rotation_mat, blade_buffer_one, blade_buffer_two);
+    for (int k = 0; k < 3; k++) blade_buffer_one[k] = blade_buffer_two[k];
+  }
+#endif
   for(int i=0;i<s_helo_surf_cnt;i++)
     sx_aerofoil_init_orient(r->surf+i);
 }
