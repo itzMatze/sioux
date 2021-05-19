@@ -28,6 +28,22 @@ int main(int argc, char *argv[])
   uint32_t sim_time = last_event;
   const uint32_t delta_sim_time = 1000.0f/60.0f; // usual vsync
   int paused = 0;
+
+  /*const char *vertical_logname = "/media/matze/T7 SSD/Bachelor/vertical_speed.txt";
+  FILE *vertical = fopen(vertical_logname, "w");
+  const char *horizontal_logname = "/media/matze/T7 SSD/Bachelor/horizontal_speed.txt";
+  FILE *horizontal = fopen(horizontal_logname, "w");
+  if (vertical == NULL || horizontal == NULL) 
+  {
+    printf("Error opening log file!\n");
+  }
+  else
+  {
+    printf("Logs successfully opened!\n");
+    fprintf(vertical, "Vertikale Geschwindigkeit in m/s:Zeit in s\n");
+    fprintf(horizontal, "Horizontale Geschwindigkeit in m/s:Zeit in s\n");
+  }*/
+
   while(1)
   {
     sx_vid_render_frame_rect();
@@ -69,10 +85,17 @@ int main(int argc, char *argv[])
       frames = 0;
       last_event = end;
     }
+    float horizontal_speed[3] = {0.0f, 0.0f, 0.0f};
+    horizontal_speed[0] = sx.world.entity[sx.world.player_entity].body.v[0];
+    horizontal_speed[2] = sx.world.entity[sx.world.player_entity].body.v[2];
+    //fprintf(vertical, "%f:%f\n", sx.world.entity[sx.world.player_entity].body.v[1], sx.time / 1000.0f);
+    //fprintf(horizontal, "%f:%f\n", length(horizontal_speed), sx.time / 1000.0f);
     // time is real time (lower gear animation etc)
     sx.time = end;
   }
 out:
+  /*fclose(vertical);
+  fclose(horizontal);*/
   sx_vid_end_mission();
   c3_mission_end(&sx.mission);
   sx_cleanup(); // also cleans vid
